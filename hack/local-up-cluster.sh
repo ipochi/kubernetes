@@ -521,7 +521,20 @@ kind: EgressSelectorConfiguration
 egressSelections:
 - name: cluster
   connection:
-    proxyProtocol: Direct
+    # This controls the protocol between the API Server and the Konnectivity
+    # server. Supported values are "GRPC" and "HTTPConnect". There is no
+    # end user visible difference between the two modes. You need to set the
+    # Konnectivity server to work in the same mode.
+    proxyProtocol: GRPC
+    transport:
+      # This controls what transport the API Server uses to communicate with the
+      # Konnectivity server. UDS is recommended if the Konnectivity server
+      # locates on the same machine as the API Server. You need to configure the
+      # Konnectivity server to listen on the same UDS socket.
+      # The other supported transport is "tcp". You will need to set up TLS
+      # config to secure the TCP transport.
+      uds:
+        udsName: /tmp/uds-proxy
 - name: controlplane
   connection:
     proxyProtocol: Direct
@@ -585,6 +598,7 @@ EOF
       --requestheader-allowed-names=system:auth-proxy \
       --proxy-client-cert-file="${CERT_DIR}/client-auth-proxy.crt" \
       --proxy-client-key-file="${CERT_DIR}/client-auth-proxy.key" \
+      --api-audiences=https://kubernetes.default.svc,system:konnectivity-server \
       --cors-allowed-origins="${API_CORS_ALLOWED_ORIGINS}" >"${APISERVER_LOG}" 2>&1 &
     APISERVER_PID=$!
 
