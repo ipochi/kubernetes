@@ -22,3 +22,5 @@ require (
 )
 
 replace k8s.io/kms => ../../../../kms
+
+replace sigs.k8s.io/apiserver-network-proxy/konnectivity-client => github.com/kinvolk/apiserver-network-proxy/konnectivity-client v0.0.25-0.20260428041604-21f7a8c97857

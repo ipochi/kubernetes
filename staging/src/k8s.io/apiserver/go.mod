@@ -57,7 +57,7 @@ require (
 	k8s.io/kube-openapi v0.0.0-20260317180543-43fb72c5454a
 	k8s.io/streaming v0.0.0
 	k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2
-	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.34.0
+	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.0.25-0.20260428041604-21f7a8c97857
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730
 	sigs.k8s.io/randfill v1.0.0
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2
@@ -139,4 +139,5 @@ replace (
 	k8s.io/component-base => ../component-base
 	k8s.io/kms => ../kms
 	k8s.io/streaming => ../streaming
+	sigs.k8s.io/apiserver-network-proxy/konnectivity-client => github.com/kinvolk/apiserver-network-proxy/konnectivity-client v0.0.25-0.20260428041604-21f7a8c97857
 )
