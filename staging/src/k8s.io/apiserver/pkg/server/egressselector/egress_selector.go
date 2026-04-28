@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -41,6 +42,7 @@ import (
 	"k8s.io/component-base/tracing"
 	"k8s.io/klog/v2"
 	client "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client"
+	clientmetrics "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client/metrics"
 )
 
 var directDialer utilnet.DialFunc = http.DefaultTransport.(*http.Transport).DialContext
@@ -163,10 +165,26 @@ var _ proxier = &grpcProxier{}
 
 type grpcProxier struct {
 	tunnel client.Tunnel
+	// invalidateFn, when non-nil, is called by createDialer if the proxy
+	// error indicates a transport-class failure. Connectors that cache a
+	// long-lived tunnel set this to a closure that detaches the specific
+	// tunnel this proxier was built with; generation-aware so a stale
+	// proxier from a previous tunnel cannot tear down a fresher cached
+	// tunnel after a concurrent rebuild.
+	invalidateFn func()
 }
 
 func (g *grpcProxier) proxy(ctx context.Context, addr string) (net.Conn, error) {
 	return g.tunnel.DialContext(ctx, "tcp", addr)
+}
+
+// invalidate implements the invalidator interface. Safe to call on a
+// proxier whose connector does not maintain a cached transport (in that
+// case invalidateFn is nil and this is a no-op).
+func (g *grpcProxier) invalidate() {
+	if g.invalidateFn != nil {
+		g.invalidateFn()
+	}
 }
 
 type proxyServerConnector interface {
@@ -210,11 +228,41 @@ func (u *udsHTTPConnectConnector) connect(ctx context.Context) (proxier, error) 
 
 type udsGRPCConnector struct {
 	udsName string
+
+	mu sync.Mutex
+	// tunnel is the cached ReusableTunnel. nil means "no current tunnel; the
+	// next connect() must build one." Mutated under mu.
+	tunnel client.ReusableTunnel
 }
 
-// connect establishes a connection to a proxy over gRPC.
-// TODO At the moment, it does not use the provided context.
-func (u *udsGRPCConnector) connect(_ context.Context) (proxier, error) {
+// connect establishes a connection to a proxy over gRPC, returning a proxier
+// that re-uses a cached client.ReusableTunnel across outbound dials. If the
+// cached tunnel has terminated (Done() fired because Close() was called and
+// per-dial child streams have drained) or is not yet built, connect rebuilds
+// it under the connector mutex. Serializing rebuilds prevents a thundering
+// herd of gRPC reconnects when the shared transport fails: every concurrent
+// failing dial would otherwise race to dial the proxy.
+func (u *udsGRPCConnector) connect(ctx context.Context) (proxier, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.tunnel != nil {
+		select {
+		case <-u.tunnel.Done():
+			// Tunnel terminated (Close() ran on a prior transport-class
+			// failure and child streams have drained). Drop and rebuild.
+			u.tunnel = nil
+		default:
+			t := u.tunnel
+			return &grpcProxier{
+				tunnel: t,
+				invalidateFn: func() {
+					u.invalidateIfCurrent(t)
+				},
+			}, nil
+		}
+	}
+
 	udsName := u.udsName
 	dialOption := grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
 		var d net.Dialer
@@ -225,19 +273,73 @@ func (u *udsGRPCConnector) connect(_ context.Context) (proxier, error) {
 		return c, err
 	})
 
-	// CreateSingleUseGrpcTunnel() unfortunately couples dial and connection contexts. Because of that,
-	// we cannot use ctx just for dialing and control the connection lifetime separately.
-	// See https://github.com/kubernetes-sigs/apiserver-network-proxy/issues/357.
-	tunnelCtx := context.TODO()
-	tunnel, err := client.CreateSingleUseGrpcTunnel(tunnelCtx, udsName, dialOption,
+	// Preserve historical dial behavior: WithBlock + WithReturnConnectionError
+	// + 30s timeout (matches http.DefaultTransport dial timeout). This keeps
+	// dial-time failures surfacing at the connect stage and preserves the
+	// existing error attribution / metric labels.
+	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	tunnel, err := client.CreateGRPCTunnel(dialCtx, udsName, dialOption,
 		grpc.WithBlock(),
 		grpc.WithReturnConnectionError(),
-		grpc.WithTimeout(30*time.Second), // matches http.DefaultTransport dial timeout
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, err
 	}
-	return &grpcProxier{tunnel: tunnel}, nil
+	u.tunnel = tunnel
+	return &grpcProxier{
+		tunnel: tunnel,
+		invalidateFn: func() {
+			u.invalidateIfCurrent(tunnel)
+		},
+	}, nil
+}
+
+// invalidateIfCurrent detaches t from the connector cache and closes it
+// asynchronously, but ONLY if t is still the currently-cached tunnel. This
+// is the generation-aware safeguard: a stale proxier from a previous
+// tunnel must not tear down a fresher tunnel that won the rebuild race.
+//
+// Concurrency scenario this protects against:
+//  1. request A receives a proxier holding tunnel T1.
+//  2. request B fails and invalidates T1 (cache cleared, T1 closed async).
+//  3. request C calls connect() and rebuilds; cache now holds T2.
+//  4. request A's proxy() finally fails on T1 (transport-class).
+//  5. A's invalidateFn fires, sees u.tunnel == T2 (not T1), and no-ops.
+//
+// Without the identity check, step 5 would tear down the fresh T2.
+//
+// Two-layer policy. ReusableTunnel.Close is blocking by contract so callers
+// that need to know the connection is fully gone (graceful shutdown, tests)
+// get that guarantee. invalidateIfCurrent runs on the outbound dial path:
+// the failing dial that triggered invalidation does not depend on the old
+// tunnel being fully drained before it returns. Closing synchronously here
+// would extend the failing-dial latency by the drain time and, in
+// pathological drain-stall scenarios, propagate that stall into every
+// concurrent failing request. Therefore close runs in a background goroutine.
+//
+// Swap-before-close bounds background goroutine count to one per
+// cached-tunnel generation: a new close goroutine can only spawn after a
+// successful connect() rebuild, which is rate-limited by the upstream's
+// responsiveness.
+func (u *udsGRPCConnector) invalidateIfCurrent(t client.ReusableTunnel) {
+	u.mu.Lock()
+	if u.tunnel != t {
+		// Already replaced (or already cleared). The caller is holding a
+		// stale tunnel reference; that tunnel will be closed by whichever
+		// invalidate path detached it originally. Nothing to do here.
+		u.mu.Unlock()
+		return
+	}
+	u.tunnel = nil
+	u.mu.Unlock()
+
+	go func() {
+		if err := t.Close(); err != nil {
+			klog.V(4).InfoS("error closing invalidated konnectivity tunnel", "err", err)
+		}
+	}()
 }
 
 type dialerCreator struct {
@@ -249,6 +351,53 @@ type dialerCreator struct {
 type metricsOptions struct {
 	transport string
 	protocol  string
+}
+
+// invalidator is implemented by proxiers backed by a cached long-lived
+// transport (e.g. a gRPC ReusableTunnel) that need to be torn down on a
+// transport-class failure so the next connect() rebuilds. Implementations
+// must be generation-aware: an invalidate() call from a stale proxier (one
+// holding a reference to a previously-cached transport) must NOT tear down
+// a fresher cached transport that won the rebuild race. Proxiers without
+// cached transport state (HTTP CONNECT) deliberately do not implement
+// this interface.
+type invalidator interface {
+	invalidate()
+}
+
+// shouldInvalidateTunnel decides whether an error returned from
+// proxier.proxy indicates the shared transport (not just one backend dial)
+// has failed. It uses the typed dial-failure reasons exported by
+// konnectivity-client to distinguish transport-class failures from
+// caller- and backend-class failures. Tearing down the tunnel for the
+// latter would cause cascading transport rebuilds whenever a backend or
+// caller is flaky.
+func shouldInvalidateTunnel(err error) bool {
+	isDialFailure, reason := client.GetDialFailureReason(err)
+	if !isDialFailure {
+		// Non-konnectivity error (for example a Go-level network error
+		// that did not pass through GetDialFailureReason wrapping).
+		// Conservative: keep the tunnel.
+		return false
+	}
+	switch reason {
+	case clientmetrics.DialFailureStreamSetup,
+		clientmetrics.DialFailureTunnelClosed:
+		// Transport-class: the shared *grpc.ClientConn or its Proxy stream
+		// machinery is unhealthy; rebuild on next connect().
+		return true
+	case clientmetrics.DialFailureContext,
+		clientmetrics.DialFailureEndpoint,
+		clientmetrics.DialFailureDialClosed,
+		clientmetrics.DialFailureUnknown:
+		// Caller- or backend-class: per-dial timeouts, cancelled requestCtx,
+		// backend pod unreachable, backend explicitly closed. Keep tunnel.
+		return false
+	default:
+		// Unknown reason: be conservative and keep the tunnel rather than
+		// risk a rebuild storm on a misclassified error.
+		return false
+	}
 }
 
 func (d *dialerCreator) createDialer() utilnet.DialFunc {
@@ -268,6 +417,18 @@ func (d *dialerCreator) createDialer() utilnet.DialFunc {
 		conn, err := proxier.proxy(ctx, addr)
 		if err != nil {
 			egressmetrics.Metrics.ObserveDialFailure(d.options.protocol, d.options.transport, egressmetrics.StageProxy)
+			// If the proxier carries a cached long-lived transport (e.g.
+			// a gRPC ReusableTunnel) and the error indicates a transport-class
+			// failure, ask it to invalidate. The proxier holds a reference
+			// to the specific tunnel that produced this error, so the
+			// invalidate is generation-aware: a stale proxier from a
+			// previous tunnel cannot tear down a fresher cached tunnel
+			// after a concurrent rebuild. Per-dial backend errors and
+			// caller-cancelled contexts deliberately do not invalidate; see
+			// shouldInvalidateTunnel.
+			if inv, ok := proxier.(invalidator); ok && shouldInvalidateTunnel(err) {
+				inv.invalidate()
+			}
 			return nil, err
 		}
 		egressmetrics.Metrics.ObserveDialLatency(egressmetrics.Metrics.Clock().Now().Sub(start), d.options.protocol, d.options.transport)

@@ -24,6 +24,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +37,7 @@ import (
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/metrics/testutil"
 	testingclock "k8s.io/utils/clock/testing"
+	konnectivityclient "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client"
 	clientmetrics "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client/metrics"
 	ccmetrics "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/common/metrics"
 	"sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
@@ -403,4 +406,406 @@ func TestGetTLSConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fakeReusableTunnel is a test double for client.ReusableTunnel. It records
+// the number of Close() calls and supports an optional release-channel that
+// blocks Close until released, for testing the swap-before-close async path.
+type fakeReusableTunnel struct {
+	closeCalls atomic.Int32
+	// closeBlock, when non-nil, makes Close block until receive succeeds.
+	// Used to verify invalidate() does not synchronously wait on Close.
+	closeBlock chan struct{}
+
+	mu   sync.Mutex
+	done chan struct{}
+}
+
+func newFakeReusableTunnel() *fakeReusableTunnel {
+	return &fakeReusableTunnel{done: make(chan struct{})}
+}
+
+func (f *fakeReusableTunnel) DialContext(_ context.Context, _, _ string) (net.Conn, error) {
+	return nil, errors.New("fakeReusableTunnel.DialContext not implemented")
+}
+
+func (f *fakeReusableTunnel) Done() <-chan struct{} { return f.done }
+
+func (f *fakeReusableTunnel) Close() error {
+	if f.closeBlock != nil {
+		<-f.closeBlock
+	}
+	f.closeCalls.Add(1)
+	f.mu.Lock()
+	select {
+	case <-f.done:
+	default:
+		close(f.done)
+	}
+	f.mu.Unlock()
+	return nil
+}
+
+// Compile-time assertion that fakeReusableTunnel implements the interface.
+var _ konnectivityclient.ReusableTunnel = (*fakeReusableTunnel)(nil)
+
+// TestUDSGRPCConnectorReusesCachedTunnel verifies that connect() returns a
+// proxier backed by the same cached ReusableTunnel on repeated calls,
+// i.e. the per-dial ClientConn churn is gone.
+func TestUDSGRPCConnectorReusesCachedTunnel(t *testing.T) {
+	c := &udsGRPCConnector{}
+	fake := newFakeReusableTunnel()
+
+	// Inject the cached tunnel directly (same package access). connect() must
+	// observe it as healthy (Done() not fired) and reuse it.
+	c.mu.Lock()
+	c.tunnel = fake
+	c.mu.Unlock()
+
+	for i := 0; i < 5; i++ {
+		p, err := c.connect(context.Background())
+		if err != nil {
+			t.Fatalf("connect(#%d): unexpected error: %v", i, err)
+		}
+		gp, ok := p.(*grpcProxier)
+		if !ok {
+			t.Fatalf("connect(#%d): expected *grpcProxier, got %T", i, p)
+		}
+		if gp.tunnel != fake {
+			t.Fatalf("connect(#%d): expected proxier to reuse cached tunnel %p, got %p", i, fake, gp.tunnel)
+		}
+	}
+	if got := fake.closeCalls.Load(); got != 0 {
+		t.Errorf("expected 0 Close calls on reused tunnel, got %d", got)
+	}
+}
+
+// TestUDSGRPCConnectorRebuildsAfterDone verifies that when the cached
+// tunnel's Done() has fired, connect() drops it and attempts a rebuild.
+// (Rebuild itself fails because there's no real proxy, which is fine;
+// what we're pinning here is the "drop and rebuild" path.)
+func TestUDSGRPCConnectorRebuildsAfterDone(t *testing.T) {
+	c := &udsGRPCConnector{udsName: "/nonexistent/socket/for/test"}
+	fake := newFakeReusableTunnel()
+	close(fake.done) // simulate the tunnel having terminated
+
+	c.mu.Lock()
+	c.tunnel = fake
+	c.mu.Unlock()
+
+	// Use a short-deadline ctx so the rebuild attempt fails fast instead of
+	// blocking on the 30s default. We don't care that it fails; we care that
+	// connect() detached the dead tunnel before attempting the rebuild.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	_, err := c.connect(ctx)
+	if err == nil {
+		t.Fatal("expected rebuild to fail against nonexistent UDS socket; got nil error")
+	}
+
+	c.mu.Lock()
+	cached := c.tunnel
+	c.mu.Unlock()
+	if cached == fake {
+		t.Errorf("expected dead tunnel to be detached before rebuild; still cached")
+	}
+}
+
+// TestUDSGRPCConnectorInvalidateIfCurrentDetachesSyncClosesAsync verifies
+// the two-layer invalidate policy: the cached pointer is cleared
+// synchronously (so a concurrent connect() can rebuild without waiting),
+// but Close on the old tunnel runs in the background.
+func TestUDSGRPCConnectorInvalidateIfCurrentDetachesSyncClosesAsync(t *testing.T) {
+	c := &udsGRPCConnector{}
+	fake := newFakeReusableTunnel()
+	fake.closeBlock = make(chan struct{}) // Close will block until released
+
+	c.mu.Lock()
+	c.tunnel = fake
+	c.mu.Unlock()
+
+	// invalidateIfCurrent must return promptly even though fake.Close() is blocked.
+	doneInvalidate := make(chan struct{})
+	go func() {
+		c.invalidateIfCurrent(fake)
+		close(doneInvalidate)
+	}()
+
+	select {
+	case <-doneInvalidate:
+	case <-time.After(2 * time.Second):
+		t.Fatal("invalidateIfCurrent did not return promptly while fake.Close() was blocked")
+	}
+
+	// Cache must be cleared synchronously.
+	c.mu.Lock()
+	cached := c.tunnel
+	c.mu.Unlock()
+	if cached != nil {
+		t.Errorf("expected cached tunnel to be nil immediately after invalidateIfCurrent; got %p", cached)
+	}
+
+	// Close should not have completed yet (still blocked).
+	if got := fake.closeCalls.Load(); got != 0 {
+		t.Errorf("expected fake.Close() to be blocked (0 calls), got %d", got)
+	}
+
+	// Release Close and verify it ran exactly once.
+	close(fake.closeBlock)
+
+	if err := waitFor(2*time.Second, func() bool {
+		return fake.closeCalls.Load() == 1
+	}); err != nil {
+		t.Fatalf("waiting for async Close: %v (calls=%d)", err, fake.closeCalls.Load())
+	}
+}
+
+// TestUDSGRPCConnectorInvalidateIfCurrentNoOpWhenEmpty verifies that
+// invalidateIfCurrent on an empty connector is a safe no-op (no panic,
+// nothing to close), and that calling it with any tunnel value when the
+// cache is nil does not close that tunnel.
+func TestUDSGRPCConnectorInvalidateIfCurrentNoOpWhenEmpty(t *testing.T) {
+	c := &udsGRPCConnector{}
+	stale := newFakeReusableTunnel()
+	c.invalidateIfCurrent(stale) // must not panic
+	c.invalidateIfCurrent(stale)
+
+	// Stale tunnel must NOT be closed by invalidateIfCurrent when it is not
+	// the currently-cached tunnel.
+	time.Sleep(50 * time.Millisecond) // give any spurious goroutine a chance
+	if got := stale.closeCalls.Load(); got != 0 {
+		t.Errorf("expected stale tunnel Close not to be called when cache is empty; got %d", got)
+	}
+}
+
+// TestUDSGRPCConnectorInvalidateIfCurrentDoesNotDoubleClose verifies the
+// swap-before-close invariant: after invalidateIfCurrent detaches a tunnel,
+// a subsequent invalidateIfCurrent on a DIFFERENT cached tunnel does NOT
+// close the original tunnel a second time.
+func TestUDSGRPCConnectorInvalidateIfCurrentDoesNotDoubleClose(t *testing.T) {
+	c := &udsGRPCConnector{}
+	first := newFakeReusableTunnel()
+	second := newFakeReusableTunnel()
+
+	c.mu.Lock()
+	c.tunnel = first
+	c.mu.Unlock()
+
+	c.invalidateIfCurrent(first) // closes first asynchronously
+	if err := waitFor(2*time.Second, func() bool {
+		return first.closeCalls.Load() == 1
+	}); err != nil {
+		t.Fatalf("waiting for first close: %v", err)
+	}
+
+	// Install a new tunnel and invalidate the second one. first must NOT
+	// be touched.
+	c.mu.Lock()
+	c.tunnel = second
+	c.mu.Unlock()
+
+	c.invalidateIfCurrent(second)
+	if err := waitFor(2*time.Second, func() bool {
+		return second.closeCalls.Load() == 1
+	}); err != nil {
+		t.Fatalf("waiting for second close: %v", err)
+	}
+
+	if got := first.closeCalls.Load(); got != 1 {
+		t.Errorf("expected first tunnel Close called exactly once total, got %d", got)
+	}
+}
+
+// TestUDSGRPCConnectorStaleProxierDoesNotInvalidateFreshTunnel pins the
+// generation-aware safeguard: a proxier holding a stale tunnel reference
+// (because a concurrent invalidate-and-rebuild swapped the cache) must
+// NOT tear down the freshly-cached tunnel when its proxy() finally fails.
+func TestUDSGRPCConnectorStaleProxierDoesNotInvalidateFreshTunnel(t *testing.T) {
+	c := &udsGRPCConnector{}
+	stale := newFakeReusableTunnel()
+	fresh := newFakeReusableTunnel()
+
+	// Build a proxier whose invalidate closure captures `stale`, simulating
+	// a request that obtained its proxier from an earlier connect() call.
+	staleProxier := &grpcProxier{
+		tunnel:       stale,
+		invalidateFn: func() { c.invalidateIfCurrent(stale) },
+	}
+
+	// Now simulate a concurrent rebuild: the cache holds `fresh`, not stale.
+	c.mu.Lock()
+	c.tunnel = fresh
+	c.mu.Unlock()
+
+	// The stale proxier's failing dial fires invalidate. Because `fresh` is
+	// cached (not `stale`), invalidateIfCurrent must no-op.
+	staleProxier.invalidate()
+
+	time.Sleep(50 * time.Millisecond) // give any spurious goroutine a chance
+
+	if got := fresh.closeCalls.Load(); got != 0 {
+		t.Errorf("fresh tunnel was Close()d by stale-proxier invalidate; got %d calls", got)
+	}
+	if got := stale.closeCalls.Load(); got != 0 {
+		t.Errorf("stale tunnel was Close()d even though it is not cached; got %d calls", got)
+	}
+
+	c.mu.Lock()
+	cached := c.tunnel
+	c.mu.Unlock()
+	if cached != fresh {
+		t.Errorf("fresh tunnel was detached from cache by stale-proxier invalidate")
+	}
+}
+
+// configurableProxierConnector returns a proxier whose proxy() method returns
+// a configurable error. The proxier optionally implements the invalidator
+// interface (when invalidatorEnabled is true) and increments invalidateCalls
+// when invoked.
+type configurableProxierConnector struct {
+	proxyErr           error
+	invalidatorEnabled bool
+	invalidateCalls    *atomic.Int32
+}
+
+func (c *configurableProxierConnector) connect(_ context.Context) (proxier, error) {
+	if c.invalidatorEnabled {
+		return &configurableInvalidatingProxier{err: c.proxyErr, calls: c.invalidateCalls}, nil
+	}
+	return &configurableProxier{err: c.proxyErr}, nil
+}
+
+type configurableProxier struct{ err error }
+
+func (p *configurableProxier) proxy(_ context.Context, _ string) (net.Conn, error) {
+	return nil, p.err
+}
+
+type configurableInvalidatingProxier struct {
+	err   error
+	calls *atomic.Int32
+}
+
+func (p *configurableInvalidatingProxier) proxy(_ context.Context, _ string) (net.Conn, error) {
+	return nil, p.err
+}
+
+func (p *configurableInvalidatingProxier) invalidate() { p.calls.Add(1) }
+
+// TestDialerCreatorInvalidatesViaProxier verifies the wiring in
+// dialerCreator.createDialer: the type assertion now targets the proxier
+// (not the connector), and only fires when shouldInvalidateTunnel(err) is
+// true. Since *dialFailure is unexported in konnectivity-client, we cannot
+// construct typed errors with arbitrary reasons; the typed-error -> reason
+// path is covered by konnectivity-client's own tests. Here we pin:
+//   - non-typed errors do not cause invalidate
+//   - success does not cause invalidate
+//   - a proxier without the invalidator interface is not asked to
+//     invalidate (compile-time + runtime: no panic on a plain proxier).
+func TestDialerCreatorInvalidatesViaProxier(t *testing.T) {
+	t.Run("plain error keeps tunnel", func(t *testing.T) {
+		var calls atomic.Int32
+		conn := &configurableProxierConnector{
+			proxyErr:           errors.New("plain network error"),
+			invalidatorEnabled: true,
+			invalidateCalls:    &calls,
+		}
+		dc := &dialerCreator{
+			connector: conn,
+			options: metricsOptions{
+				transport: metrics.TransportUDS,
+				protocol:  metrics.ProtocolGRPC,
+			},
+		}
+		dialer := dc.createDialer()
+		_, _ = dialer(context.Background(), "tcp", "anything:1234")
+
+		if got := calls.Load(); got != 0 {
+			t.Errorf("expected invalidate not to be called for plain error; got %d calls", got)
+		}
+	})
+
+	t.Run("success keeps tunnel", func(t *testing.T) {
+		var calls atomic.Int32
+		conn := &configurableProxierConnector{
+			proxyErr:           nil,
+			invalidatorEnabled: true,
+			invalidateCalls:    &calls,
+		}
+		dc := &dialerCreator{
+			connector: conn,
+			options: metricsOptions{
+				transport: metrics.TransportUDS,
+				protocol:  metrics.ProtocolGRPC,
+			},
+		}
+		dialer := dc.createDialer()
+		_, _ = dialer(context.Background(), "tcp", "anything:1234")
+
+		if got := calls.Load(); got != 0 {
+			t.Errorf("expected invalidate not to be called on success; got %d calls", got)
+		}
+	})
+
+	t.Run("non-invalidator proxier does not panic on error", func(t *testing.T) {
+		conn := &configurableProxierConnector{
+			proxyErr:           errors.New("plain network error"),
+			invalidatorEnabled: false, // proxier returned does NOT implement invalidator
+		}
+		dc := &dialerCreator{
+			connector: conn,
+			options: metricsOptions{
+				transport: metrics.TransportUDS,
+				protocol:  metrics.ProtocolHTTPConnect,
+			},
+		}
+		dialer := dc.createDialer()
+		_, _ = dialer(context.Background(), "tcp", "anything:1234")
+		// Test passes if no panic.
+	})
+}
+
+// TestShouldInvalidateTunnelClassification pins the conservative branches of
+// the helper: any error that is not a typed konnectivity dial-failure must
+// keep the tunnel. Typed-reason classification is exercised end-to-end in
+// konnectivity-client's own tests.
+func TestShouldInvalidateTunnelClassification(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error keeps tunnel", nil, false},
+		{"plain error keeps tunnel", errors.New("network unreachable"), false},
+		{"wrapped plain error keeps tunnel", fmt.Errorf("layer1: %w", errors.New("layer2")), false},
+		{"context cancelled keeps tunnel", context.Canceled, false},
+		{"deadline exceeded keeps tunnel", context.DeadlineExceeded, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldInvalidateTunnel(tc.err); got != tc.want {
+				t.Errorf("shouldInvalidateTunnel(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+
+	// Sanity: the helper references the new clientmetrics constants. If they
+	// were renamed or removed, this would fail to compile, surfacing the
+	// dependency between this PR and the konnectivity-client release.
+	_ = clientmetrics.DialFailureStreamSetup
+	_ = clientmetrics.DialFailureTunnelClosed
+}
+
+// waitFor polls cond at 10ms intervals until it returns true or timeout
+// elapses. Returns an error on timeout.
+func waitFor(timeout time.Duration, cond func() bool) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return fmt.Errorf("condition not met within %v", timeout)
 }
